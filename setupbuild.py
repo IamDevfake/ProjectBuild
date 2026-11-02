@@ -30,8 +30,23 @@ setupbuild.py — สแกนโปรเจกต์แล้ว build เป�
 ถ้าสแกนผิดจุดไหน สร้างไฟล์ autobuild.json แล้วใส่เฉพาะค่าที่ต้องการแก้ — จะทับผลสแกนเฉพาะคีย์นั้น
   เช่น {"project_type": "go", "build_commands": [["go","build","-o","dist/app.exe","."]], "icon": false}
 
-ตัวเลือก
+คำสั่ง (positional)
+  missing         ดูเฉพาะสิ่งที่ยังไม่ได้ติดตั้ง พร้อมวิธีติดตั้งแต่ละรายการ
+  status          ดูทั้งหมด: ที่ติดตั้งแล้ว + ที่ยังขาด
+  install [ชื่อ]  ติดตั้งสิ่งที่ยังขาดโดยไม่ build · ไม่ระบุชื่อ = ติดตั้งทั้งหมด · ระบุชื่อ = เฉพาะตัวนั้น
+  push [ข้อความ]  เชื่อมต่อและ push โค้ดขึ้น GitHub อัตโนมัติ (add, commit, push)
+  scan            สแกนอย่างเดียว ดูผลการตรวจ ไม่ build
+  dry-run         แสดงคำสั่ง build โดยไม่รันจริง
+  logs            ดึง/วิเคราะห์ log ล่าสุดของโปรแกรม Python ที่ build แล้ว
+  init            บันทึกผลสแกนเป็น autobuild.json ไว้แก้ต่อ
+  commands        แสดงคำสั่งทั้งหมดพร้อมตัวอย่างการใช้งาน
+  (ไม่ระบุคำสั่ง) build ครบทุกขั้นตอน (สแกน → ติดตั้ง → build → ทดสอบ → ตัวติดตั้ง)
+
+ตัวเลือก (flags)
   --scan-only     สแกนแล้วแสดงผลอย่างเดียว ไม่ build
+  --missing       ดูเฉพาะสิ่งที่ยังไม่ได้ติดตั้ง (เหมือนคำสั่ง missing)
+  --status        ดูทั้งหมด ทั้งที่ติดตั้งแล้วและที่ยังขาด
+  --install       ติดตั้งสิ่งที่ยังขาด (เหมือนคำสั่ง install)
   --init          บันทึกผลสแกนเป็น autobuild.json ไว้แก้ต่อ
   --dry-run       แสดงคำสั่ง build โดยไม่รันจริง
   --yes           ตอบรับค่าเริ่มต้นทุกคำถาม (รันโดยไม่ต้องมีคนคอย)
@@ -1799,8 +1814,10 @@ def step_scan(cfg_path, args):
         forced = getattr(args, "type", None) or user.get("project_type")
         auto, rep = auto_dispatch(HERE, forced)
         merge_cfg(cfg, auto)
+        quiet = getattr(args, "quiet_scan", False)
         for st, msg in rep:
-            print(f"  {ICON[st]} {msg}")
+            if not (quiet and st not in (FAIL, WARN) and not msg.startswith("ชนิดโปรเจกต์")):
+                print(f"  {ICON[st]} {msg}")
             if st == FAIL:
                 status = FAIL
             elif st == WARN and status == OK:
@@ -1863,10 +1880,17 @@ def step_pip():
         if rc == 0:
             print(f"  {ICON[OK]} {req}  {G}ติดตั้งสำเร็จ{X}")
         else:
-            print(f"  {ICON[WARN]} {req}  {Y}ติดตั้งไม่ครบ — จะลองทีละตัวต่อ{X}")
+            print(f"  {ICON[WARN]} {req}  {Y}ติดตั้งไม่ครบ — จะลองทีละบรรทัดต่อ{X}")
             for r in tail(out, 4):
                 print(f"      {D}{r[:100]}{X}")
             result = WARN
+            for spec in _req_specs(here(req)):          # ล้มทั้งไฟล์ → ลองทีละบรรทัด ไม่ให้บรรทัดเดียวพังทั้งหมด
+                nm = re.match(r"^([A-Za-z0-9][A-Za-z0-9._\-]*)", spec).group(1)
+                if _pkg_installed(nm):
+                    continue
+                rc1, out1 = _pip_install([spec])
+                mark = ICON[OK] if rc1 == 0 else ICON[WARN]
+                print(f"  {mark} {spec:<22} {G + 'ติดตั้งสำเร็จ' if rc1 == 0 else Y + 'ติดตั้งไม่สำเร็จ'}{X}")
 
     pkgs = CFG["python_packages"]
     if not pkgs and not req:
@@ -2400,6 +2424,631 @@ def step_installer():
     return WARN
 
 
+# ═══ Git / GitHub: เชื่อมต่อและ push อัตโนมัติ ═══════════════════
+DEFAULT_GITIGNORE = """# โฟลเดอร์ build และผลลัพธ์
+dist/
+build/
+*.spec
+installer_output/
+logs/
+build_log.txt
+installer_log.txt
+autobuild_report.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+"""
+
+
+def _ensure_gitignore():
+    gi_path = here(".gitignore")
+    if not os.path.exists(gi_path):
+        try:
+            with open(gi_path, "w", encoding="utf-8") as gf:
+                gf.write(DEFAULT_GITIGNORE)
+            say("สร้างไฟล์ .gitignore ให้แล้ว (กันไม่ให้ push โฟลเดอร์ build/dist ขึ้น Git)", G)
+        except OSError:
+            pass
+    else:
+        try:
+            with open(gi_path, "r", encoding="utf-8", errors="replace") as gf:
+                c = gf.read()
+            additions = []
+            for pat in ["dist/", "build/", "logs/", "build_log.txt", "autobuild_report.txt"]:
+                if pat not in c:
+                    additions.append(pat)
+            if additions:
+                with open(gi_path, "a", encoding="utf-8") as gf:
+                    gf.write("\n# AutoBuild artifacts\n" + "\n".join(additions) + "\n")
+                say("เพิ่มโฟลเดอร์ build/dist ลงใน .gitignore ให้แล้ว", D)
+        except OSError:
+            pass
+
+
+def _git_status():
+    """แสดงสถานะ Git: branch, remote, ไฟล์ที่มีการเปลี่ยนแปลง, commit ค้าง push"""
+    dot_git = here(".git")
+    if not os.path.isdir(dot_git):
+        say("โฟลเดอร์นี้ยังไม่ได้เป็น Git repository (รัน  python " + _script() + " push  เพื่อเริ่มต้น)", Y)
+        return WARN
+
+    rc_br, br_out = run_quiet(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = br_out.strip() if rc_br == 0 and br_out.strip() else "main"
+
+    rc_rem, rem_out = run_quiet(["git", "remote", "get-url", "origin"])
+    origin_url = rem_out.strip() if rc_rem == 0 and rem_out.strip() else "(ยังไม่มี remote)"
+
+    say(f"Branch: {branch}", B)
+    say(f"Remote (origin): {origin_url}", G if rc_rem == 0 else Y)
+
+    # ตรวจสอบไฟล์ที่เปลี่ยนแปลง
+    rc_st, st_out = run_quiet(["git", "status", "--short"])
+    lines = [ln for ln in st_out.strip().splitlines() if ln.strip()]
+    if lines:
+        say(f"ไฟล์ที่มีการเปลี่ยนแปลง ({len(lines)} รายการ):", Y)
+        for ln in lines[:10]:
+            print(f"      {D}{ln}{X}")
+        if len(lines) > 10:
+            print(f"      {D}… และอีก {len(lines) - 10} รายการ{X}")
+    else:
+        say("ไฟล์ในเครื่อง: ตรงกับ commit ล่าสุดแล้ว (Working tree clean)", G)
+
+    # ตรวจสอบ commit ที่ยังไม่ได้ push
+    if rc_rem == 0:
+        rc_unp, unp_out = run_quiet(["git", "log", f"origin/{branch}..HEAD", "--oneline"])
+        if rc_unp == 0 and unp_out.strip():
+            unp_lines = [ln for ln in unp_out.strip().splitlines() if ln.strip()]
+            say(f"มี commit ที่ยังไม่ได้ Push ขึ้น GitHub ({len(unp_lines)} รายการ):", Y)
+            for ln in unp_lines:
+                print(f"      {Y}↑{X} {ln}")
+            say("สั่ง push ได้เลยด้วย:  python " + _script() + " push", D)
+        elif rc_unp == 0:
+            say("สถานะบน GitHub: ตรงกับในเครื่องแล้ว (Up to date)", G)
+
+    return OK
+
+
+def _git_pull():
+    """ดึงโค้ดล่าสุดจาก GitHub (git pull --rebase)"""
+    rc_br, br_out = run_quiet(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = br_out.strip() if rc_br == 0 and br_out.strip() else "main"
+    print(f"  {B}…{X} กำลังดึงข้อมูลล่าสุดจาก GitHub ({branch}) ...", end="", flush=True)
+    rc, out = run_quiet(["git", "pull", "--rebase", "origin", branch], timeout=180)
+    print("\r" + " " * 70 + "\r", end="")
+    if rc == 0:
+        say(f"✓ ดึงโค้ดล่าสุดจาก GitHub เรียบร้อยแล้ว (branch: {branch})", G)
+        for r in tail(out, 3):
+            if r.strip():
+                print(f"      {D}{r[:100]}{X}")
+        return OK
+    say("ดึงข้อมูลจาก GitHub ไม่สำเร็จ", R)
+    for r in tail(out, 5):
+        print(f"      {D}{r[:110]}{X}")
+    return WARN
+
+
+def _git_log():
+    """แสดงประวัติ commit ล่าสุด"""
+    rc, out = run_quiet(["git", "log", "-n", "8", "--oneline", "--decorate"])
+    if rc != 0 or not out.strip():
+        say("ยังไม่มีประวัติ commit ในโปรเจกต์นี้", Y)
+        return WARN
+    say("ประวัติ commit ล่าสุด:", B)
+    for ln in out.strip().splitlines():
+        print(f"      {ln}")
+    return OK
+
+
+def step_git(commit_words=None):
+    """เชื่อมต่อและ push โค้ดขึ้น GitHub อัตโนมัติ (ไม่ต้องพิมพ์คำสั่ง git เอง)"""
+    words = list(commit_words or [])
+    subcmd = words[0].lower() if words else ""
+
+    # ตรวจสอบคำสั่งย่อย (subcommands)
+    if subcmd in ("status", "st"):
+        return _git_status()
+    if subcmd in ("pull", "update", "sync"):
+        return _git_pull()
+    if subcmd in ("log", "logs", "history"):
+        return _git_log()
+    if subcmd in ("help", "commands"):
+        print_git_commands()
+        return OK
+
+    git_bin = shutil.which("git")
+    if not git_bin:
+        say("ยังไม่ได้ติดตั้ง Git ในเครื่อง", Y)
+        if shutil.which("winget") and ask_yes("ติดตั้ง Git ผ่าน winget ตอนนี้ไหม?", default=True):
+            print(f"  {B}…{X} กำลังติดตั้ง Git ผ่าน winget", end="", flush=True)
+            run_quiet(["winget", "install", "--id", "Git.Git", "-e",
+                       "--accept-package-agreements", "--accept-source-agreements"], timeout=1800)
+            print("\r" + " " * 60 + "\r", end="")
+            git_bin = shutil.which("git")
+        if not git_bin:
+            say("ไม่พบ Git — กรุณาติดตั้ง Git จาก https://git-scm.com แล้วลองใหม่อีกครั้ง", R)
+            return FAIL
+
+    dot_git = here(".git")
+    if not os.path.isdir(dot_git):
+        say("โปรเจกต์นี้ยังไม่ได้เริ่มต้น Git repository", Y)
+        if not ask_yes("เริ่มต้น Git ในโฟลเดอร์นี้ (git init) เลยไหม?", default=True):
+            say("ยกเลิกการทำงาน Git", D)
+            return SKIP
+        rc, out = run_quiet(["git", "init"])
+        if rc != 0:
+            say(f"เริ่มต้น Git ไม่สำเร็จ: {out}", R)
+            return FAIL
+        run_quiet(["git", "branch", "-M", "main"])
+        say("เริ่มต้น Git repository สำเร็จ (branch: main)", G)
+
+    _ensure_gitignore()
+
+    rc, remote_out = run_quiet(["git", "remote", "get-url", "origin"])
+    origin_url = remote_out.strip() if rc == 0 else ""
+    if origin_url:
+        say(f"GitHub Remote: {origin_url}", G)
+        if not ASSUME_YES and ask_yes("ต้องการเปลี่ยน URL ของ GitHub Repository ไหม?", default=False):
+            origin_url = ""
+
+    if not origin_url:
+        if words:
+            for w in list(words):
+                if w.startswith("http://") or w.startswith("https://") or w.startswith("git@"):
+                    origin_url = w
+                    words.remove(w)
+                    break
+
+        if not origin_url:
+            say("ยังไม่ได้เชื่อมต่อกับ GitHub Repository (ไม่มี remote origin)", Y)
+            if ASSUME_YES:
+                say("โหมดอัตโนมัติ (--yes) ข้ามการตั้งค่า remote — กรุณาระบุ URL เช่น  python setupbuild.py push <github-url>", Y)
+                return SKIP
+            try:
+                url_input = input(f"  {B}?{X} ใส่ URL ของ GitHub Repository (เช่น https://github.com/user/repo.git): ").strip()
+            except EOFError:
+                url_input = ""
+            if not url_input:
+                say("ไม่ได้ระบุ URL — ยกเลิกการ push", Y)
+                return SKIP
+            origin_url = url_input
+
+        rc_chk, _ = run_quiet(["git", "remote"])
+        if "origin" in rc_chk:
+            run_quiet(["git", "remote", "set-url", "origin", origin_url])
+        else:
+            run_quiet(["git", "remote", "add", "origin", origin_url])
+        say(f"เชื่อมต่อกับ Remote แล้ว: {origin_url}", G)
+
+    rc_n, name_out = run_quiet(["git", "config", "user.name"])
+    rc_e, email_out = run_quiet(["git", "config", "user.email"])
+    if not name_out.strip() or not email_out.strip():
+        say("ยังไม่ได้ตั้งค่าชื่อหรืออีเมล Git สำหรับบันทึก commit", Y)
+        if not ASSUME_YES:
+            try:
+                if not name_out.strip():
+                    u_name = input(f"  {B}?{X} ใส่ชื่อของคุณ (เช่น John Doe): ").strip()
+                    if u_name:
+                        run_quiet(["git", "config", "user.name", u_name])
+                if not email_out.strip():
+                    u_email = input(f"  {B}?{X} ใส่อีเมลของคุณ (เช่น user@example.com): ").strip()
+                    if u_email:
+                        run_quiet(["git", "config", "user.email", u_email])
+            except EOFError:
+                pass
+
+    rc_br, br_out = run_quiet(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = br_out.strip() if rc_br == 0 and br_out.strip() else "main"
+
+    run_quiet(["git", "add", "-A"])
+    rc_st, st_out = run_quiet(["git", "status", "--porcelain"])
+    changed = bool(st_out.strip())
+
+    if changed:
+        lines = [ln for ln in st_out.strip().splitlines() if ln.strip()]
+        say(f"พบไฟล์ที่มีการเปลี่ยนแปลง {len(lines)} รายการ", G)
+        for ln in lines[:8]:
+            print(f"      {D}{ln}{X}")
+        if len(lines) > 8:
+            print(f"      {D}… และอีก {len(lines) - 8} รายการ{X}")
+
+        if words:
+            msg = " ".join(words)
+        else:
+            default_msg = f"Update ({time.strftime('%Y-%m-%d %H:%M')})"
+            if ASSUME_YES:
+                msg = default_msg
+            else:
+                try:
+                    inp = input(f'  {B}?{X} ข้อความ Commit [กด Enter เพื่อใช้: "{default_msg}"]: ').strip()
+                    msg = inp or default_msg
+                except EOFError:
+                    msg = default_msg
+
+        print(f'  {B}…{X} กำลังบันทึก commit: "{msg}"', end='', flush=True)
+        rc_c, out_c = run_quiet(["git", "commit", "-m", msg])
+        print("\r" + " " * 70 + "\r", end="")
+        if rc_c != 0:
+            say("Commit ไม่สำเร็จ", R)
+            for r in tail(out_c, 4):
+                print(f"      {D}{r[:100]}{X}")
+            return FAIL
+        say(f'Commit สำเร็จ: "{msg}"', G)
+    else:
+        say("ไม่มีไฟล์เปลี่ยนแปลงที่ต้อง commit ใหม่", D)
+
+    print(f"  {B}…{X} กำลัง Push ขึ้น GitHub ({branch} → origin) ...", end="", flush=True)
+    rc_p, out_p = run_quiet(["git", "push", "-u", "origin", branch], timeout=180)
+    print("\r" + " " * 70 + "\r", end="")
+
+    if rc_p == 0:
+        say(f"✓ Push ขึ้น GitHub เรียบร้อยแล้ว! (branch: {branch})", G)
+        view_url = origin_url.rstrip(".git")
+        if view_url.startswith("git@github.com:"):
+            view_url = "https://github.com/" + view_url.split("git@github.com:")[-1]
+        say(f"ดูโค้ดบน GitHub: {view_url}", B)
+        return OK
+
+    say(f"Push ไปยัง GitHub ไม่สำเร็จ", R)
+    low_p = out_p.lower()
+
+    if "fetch first" in low_p or "non-fast-forward" in low_p or "behind" in low_p:
+        say("สาเหตุ: บน GitHub มี commit ใหม่กว่าในเครื่องของคุณ", Y)
+        if ask_yes("ต้องการดึงข้อมูลล่าสุดและรวมเข้าด้วยกัน (git pull --rebase) แล้ว push ใหม่ไหม?", default=True):
+            print(f"  {B}…{X} กำลังดึงข้อมูลล่าสุด (pull --rebase)", end="", flush=True)
+            rc_pull, out_pull = run_quiet(["git", "pull", "--rebase", "origin", branch])
+            print("\r" + " " * 70 + "\r", end="")
+            if rc_pull == 0:
+                say("รวมข้อมูลล่าสุดสำเร็จ — กำลัง push ใหม่", G)
+                rc_p2, out_p2 = run_quiet(["git", "push", "-u", "origin", branch], timeout=180)
+                if rc_p2 == 0:
+                    say(f"✓ Push ขึ้น GitHub เรียบร้อยแล้ว! (branch: {branch})", G)
+                    view_url = origin_url.rstrip(".git")
+                    if view_url.startswith("git@github.com:"):
+                        view_url = "https://github.com/" + view_url.split("git@github.com:")[-1]
+                    say(f"ดูโค้ดบน GitHub: {view_url}", B)
+                    return OK
+                else:
+                    out_p = out_p2
+            else:
+                say("Pull --rebase ไม่สำเร็จ (อาจมี conflict):", R)
+                for r in tail(out_pull, 4):
+                    print(f"      {D}{r[:100]}{X}")
+                return FAIL
+
+    if "permission to" in low_p or "denied" in low_p or "could not read from remote" in low_p or "authentication failed" in low_p:
+        say("สาเหตุ: ไม่ผ่านการตรวจสอบสิทธิ์ GitHub (Authentication Failed / Permission Denied)", Y)
+        say("วิธีแก้ปัญหา:", Y)
+        say("  1) กรณีใช้ HTTPS: GitHub กำหนดให้ใช้ Personal Access Token (PAT) แทนรหัสผ่านปกติ", D)
+        say("     - ไปที่ GitHub > Settings > Developer Settings > Personal access tokens > Tokens (classic)", D)
+        say("     - กด Generate new token เลือกสิทธิ์ 'repo' แล้วคัดลอก Token มาใส่เมื่อระบบถามรหัสผ่าน", D)
+        say("  2) หรือติดตั้ง GitHub CLI แล้วล็อกอินเพียงครั้งเดียวด้วยคำสั่ง:  gh auth login", D)
+        say("  3) หรือเปลี่ยน Remote เป็นแบบ SSH:  git remote set-url origin git@github.com:user/repo.git", D)
+    else:
+        for r in tail(out_p, 6):
+            print(f"      {D}{r[:110]}{X}")
+
+    return WARN
+
+
+# ═══ ดูสิ่งที่ยังไม่ได้ติดตั้ง · สั่งติดตั้ง · ดูคำสั่งทั้งหมด ═══════
+def _norm_pkg(n):
+    return re.sub(r"[-_.]+", "-", (n or "").strip().lower())
+
+
+def _req_names(path):
+    """ชื่อแพ็กเกจใน requirements.txt (ข้ามคอมเมนต์ / -r / URL)"""
+    out = []
+    for ln in _read_text(path).splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if not ln or ln.startswith("-") or "://" in ln or ln.startswith("git+"):
+            continue
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._\-]*)", ln)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def _req_specs(path):
+    """บรรทัดใน requirements.txt ที่ติดตั้งได้ (คงเงื่อนไขเวอร์ชันไว้)"""
+    out = []
+    for ln in _read_text(path).splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if ln and not ln.startswith("-") and "://" not in ln and not ln.startswith("git+"):
+            out.append(ln)
+    return out
+
+
+def _pkg_installed(name):
+    try:
+        from importlib.metadata import version
+        version(name)
+        return True
+    except Exception:
+        return False
+
+
+def collect_status():
+    """รวบรวมทุกอย่างที่โปรเจกต์ต้องใช้ → [{kind, name, required, ok, how, desc}]"""
+    items = []
+    if not _is_generic():
+        seen = set()
+        for p in CFG.get("python_packages", []):
+            seen.add(_norm_pkg(p["pip"]))
+            items.append({"kind": "ไลบรารี Python", "name": p["pip"], "required": p.get("required", False),
+                          "ok": has_module(p["module"]), "how": f"pip install {p['pip']}",
+                          "desc": p.get("desc", "")})
+        req = CFG.get("requirements_file")
+        if req and os.path.isfile(here(req)):
+            for n in _req_names(here(req)):
+                if _norm_pkg(n) in seen:
+                    continue
+                seen.add(_norm_pkg(n))
+                items.append({"kind": "ไลบรารี Python", "name": n, "required": True,
+                              "ok": _pkg_installed(n), "how": f"pip install {n}", "desc": f"จาก {req}"})
+    for t in CFG.get("external_tools", []):
+        req = t.get("required", False)
+        if t.get("winget_id"):
+            how = f"winget install --id {t['winget_id']} -e"
+        else:
+            how = t.get("manual", "ติดตั้งเอง")
+        items.append({"kind": "เครื่องมือ build" if req else "เครื่องมือเสริม", "name": t["name"],
+                      "required": req, "ok": bool(find_tool(t)), "how": how, "desc": t.get("desc", "")})
+    if _is_generic():
+        b = CFG.get("builder", {})
+        deps = b.get("deps") or []
+        if deps and deps[0] and deps[0][0] in ("npm", "pnpm", "yarn"):
+            nm = here(b.get("cwd", "."), "node_modules")
+            items.append({"kind": "dependencies", "name": "node_modules", "required": True,
+                          "ok": os.path.isdir(nm), "how": " ".join(deps[0]), "desc": "ไลบรารีของโปรเจกต์ (JavaScript)"})
+    return items
+
+
+def _script():
+    return os.path.basename(SELF)
+
+
+def step_status(show_all=False):
+    items = collect_status()
+    if not items:
+        say("โปรเจกต์นี้ไม่มีรายการไลบรารี/เครื่องมือที่ต้องตรวจ", D)
+        return SKIP
+    missing = [i for i in items if not i["ok"]]
+    shown = items if show_all else missing
+    for i in sorted(shown, key=lambda x: (x["ok"], not x["required"], x["kind"], x["name"].lower())):
+        if i["ok"]:
+            mark, tag = ICON[OK], f"{D}ติดตั้งแล้ว{X}"
+        else:
+            mark = ICON[FAIL] if i["required"] else ICON[WARN]
+            tag = f"{R}ยังไม่ได้ติดตั้ง · จำเป็น{X}" if i["required"] else f"{Y}ยังไม่ได้ติดตั้ง · ไม่บังคับ{X}"
+        print(f"  {mark} {i['name']:<18} {D}{i['kind']:<16}{X} {tag}")
+        if not i["ok"]:
+            print(f"      {D}ติดตั้งด้วย: {i['how']}{X}")
+    req_missing = [i for i in missing if i["required"]]
+    print()
+    if not missing:
+        say(f"ครบทุกรายการ ({len(items)} รายการ) — ไม่มีอะไรที่ยังไม่ได้ติดตั้ง", G)
+        return OK
+    say(f"ยังไม่ได้ติดตั้ง {len(missing)} จาก {len(items)} รายการ "
+        f"(จำเป็น {len(req_missing)} · ไม่บังคับ {len(missing) - len(req_missing)})", Y)
+    say(f"ติดตั้งทั้งหมดที่ขาด:    python {_script()} install", D)
+    pick = next((i for i in missing if i["kind"] != "dependencies"), None)
+    if pick:
+        say(f"ติดตั้งเฉพาะบางตัว:     python {_script()} install <ชื่อ> ...   เช่น  install {pick['name']}", D)
+    return FAIL if req_missing else WARN
+
+
+def _filter_install(names):
+    """เหลือเฉพาะรายการที่ตรงกับชื่อที่ระบุ · คืนชื่อที่ไม่ตรงกับอะไรเลย"""
+    want = {n.lower() for n in names}
+    left = set(want)
+    pk = []
+    for p in CFG.get("python_packages", []):
+        keys = {p["module"].lower(), p["pip"].lower()}
+        if keys & want:
+            pk.append(p)
+            left -= keys & want
+    tl = []
+    for t in CFG.get("external_tools", []):
+        keys = {t["name"].lower()} | {c.lower() for c in t.get("commands", [])}
+        if keys & want:
+            tl.append(t)
+            left -= keys & want
+    if not _is_generic():                           # ชื่อที่ไม่อยู่ในรายการ → ลอง pip install ตรงๆ
+        for n in sorted(left):
+            pk.append({"module": n, "pip": n, "required": False, "desc": "ระบุเอง"})
+        left = set()
+    CFG["python_packages"], CFG["external_tools"], CFG["requirements_file"] = pk, tl, None
+    return sorted(left)
+
+
+_RANK = {FAIL: 3, WARN: 2, OK: 1, SKIP: 0}
+
+
+def step_install(names):
+    """ติดตั้งสิ่งที่ยังขาด (ทั้งหมด หรือเฉพาะชื่อที่ระบุ) โดยไม่ build"""
+    named = bool(names)
+    snapshot = (CFG.get("python_packages"), CFG.get("external_tools"), CFG.get("requirements_file"))
+    try:
+        return _step_install(names, named)
+    finally:                                           # คืนรายการเต็ม เพื่อให้ขั้น "ตรวจซ้ำ" ดูครบทุกรายการ
+        CFG["python_packages"], CFG["external_tools"], CFG["requirements_file"] = snapshot
+
+
+def _step_install(names, named):
+    if named:
+        unknown = _filter_install(names)
+        for n in unknown:
+            say(f"ไม่รู้จัก “{n}” ในโปรเจกต์นี้ — ดูรายการด้วย: python {_script()} status", Y)
+        if not CFG["python_packages"] and not CFG["external_tools"]:
+            return WARN
+    if _is_generic():
+        parts = [("เครื่องมือ build", step_tools)] + ([] if named else [("dependencies ของโปรเจกต์", step_deps_generic)])
+    else:
+        parts = [("ไลบรารี Python", step_pip), ("เครื่องมือเสริม", step_tools)]
+    worst = SKIP
+    for title, fn in parts:
+        if named and ((fn is step_pip and not CFG["python_packages"]) or (fn is step_tools and not CFG["external_tools"])):
+            continue
+        print()
+        say(f"▸ {title}", B)
+        st = fn()
+        if _RANK[st] > _RANK[worst]:
+            worst = st
+    return worst
+
+
+def print_git_commands():
+    n = _script()
+    p = f"python {n}"
+
+    def sec(t):
+        print(f"\n{M}  {t}{X}")
+        print(f"{D}  " + "─" * 66 + f"{X}")
+
+    def row(cmd, desc, ex=None):
+        print(f"  {B}{cmd}{X}")
+        print(f"      {desc}")
+        if ex:
+            print(f"      {D}ตัวอย่าง:{X} {G}{ex}{X}")
+
+    print(f"\n{M}  {n} — คำสั่งทั้งหมดในส่วนของ Git & GitHub{X}")
+    print(f"  {D}เชื่อมต่อ จัดการ และ push โค้ดขึ้น GitHub ให้อัตโนมัติ (ไม่ต้องจำหรือพิมพ์คำสั่ง git เอง){X}")
+
+    sec("คำสั่งพื้นฐาน Git / GitHub (ทำงานอัตโนมัติในคำสั่งเดียว)")
+    row("push   (หรือ git)", "ตรวจจับไฟล์ที่เปลี่ยน → add → commit → push ขึ้น GitHub ให้อัตโนมัติ",
+        f"{p} push        |        {p} git")
+    row("push [ข้อความ commit]", "Push ทันทีพร้อมระบุข้อความ commit (ไม่ต้องรอพิมพ์ถาม)",
+        f'{p} push "อัปเดตระบบ build ล่าสุด"        |        {p} git "fix: แก้ไขบั๊ก"')
+    row("push [url] [ข้อความ]", "เชื่อมต่อ GitHub Repository ครั้งแรก (กรณีโปรเจกต์ยังไม่มี remote origin) พร้อม commit และ push",
+        f'{p} push https://github.com/user/repo.git "first commit"')
+
+    sec("คำสั่งดูสถานะและจัดการ (Git Utility)")
+    row("push status   (หรือ git status)", "ตรวจสอบสถานะ Git ปัจจุบัน: ดู branch, remote URL, ไฟล์ที่แก้ และ commit ที่ยังไม่ได้ push",
+        f"{p} push status        |        {p} git status")
+    row("push pull   (หรือ git pull)", "ดึงโค้ดเวอร์ชันล่าสุดจาก GitHub มารวมกับในเครื่อง (git pull --rebase)",
+        f"{p} push pull        |        {p} git pull")
+    row("push log   (หรือ git log)", "ดูประวัติ commit ล่าสุด 8 รายการ",
+        f"{p} push log        |        {p} git log")
+
+    sec("ตัวเลือกเสริม (Flags)")
+    row("--yes", "โหมดอัตโนมัติ ตอบรับค่าเริ่มต้นทุกคำถาม และใช้เวลาปัจจุบันเป็นข้อความ commit อัตโนมัติ",
+        f"{p} push --yes")
+    row("--project โฟลเดอร์", "สั่งรันคำสั่ง Git กับโฟลเดอร์โปรเจกต์อื่น",
+        f'{p} push --project "C:\\Users\\me\\myapp"')
+
+    sec("ตัวอย่างสถานการณ์การใช้งานจริง")
+    print(f"  {D}1) สั่ง push ทันที (จะถามข้อความ commit หรือกด Enter เพื่อใช้ข้อความเริ่มต้น):{X}")
+    print(f"       {G}{p} push{X}   (หรือ  {G}{p} git{X})")
+    print(f"  {D}2) สั่ง push พร้อมระบุข้อความ commit ในบรรทัดเดียว:{X}")
+    print(f"       {G}{p} push \"เพิ่มระบบแจ้งเตือน\"{X}")
+    print(f"  {D}3) เชื่อมต่อ GitHub ครั้งแรกพร้อม push ทันที:{X}")
+    print(f"       {G}{p} push https://github.com/myprojectyou/mynameproject.git \"first commit\"{X}")
+    print(f"  {D}4) ตรวจดูว่ามีไฟล์อะไรแก้ไขอยู่บ้าง และโค้ดตรงกับ GitHub ไหม:{X}")
+    print(f"       {G}{p} git status{X}   (หรือ  {G}{p} push status{X})")
+    print(f"  {D}5) ดึงโค้ดล่าสุดจาก GitHub ลงเครื่อง:{X}")
+    print(f"       {G}{p} git pull{X}     (หรือ  {G}{p} push pull{X})")
+    print(f"  {D}6) ดูประวัติการ commit ย้อนหลัง:{X}")
+    print(f"       {G}{p} git log{X}      (หรือ  {G}{p} push log{X})")
+    print(f"\n  {D}ดูคำสั่งทั้งหมดของโปรแกรม:  {p} commands{X}\n")
+
+
+def print_commands(topic=None):
+    if topic in ("git", "push", "github"):
+        print_git_commands()
+        return
+
+    n = _script()
+    p = f"python {n}"
+
+    def sec(t):
+        print(f"\n{M}  {t}{X}")
+        print(f"{D}  " + "─" * 66 + f"{X}")
+
+    def row(cmd, desc, ex=None):
+        print(f"  {B}{cmd}{X}")
+        print(f"      {desc}")
+        if ex:
+            print(f"      {D}ตัวอย่าง:{X} {G}{ex}{X}")
+
+    print(f"\n{M}  {n} — คำสั่งทั้งหมด{X}")
+    print(f"  {D}เรียกได้ 2 แบบ ให้ผลเหมือนกัน:  {p} <คำสั่ง>   หรือ   {p} --<ตัวเลือก>{X}")
+
+    sec("คำสั่งหลัก")
+    row(p, "สแกนโปรเจกต์ แล้ว build ครบทุกขั้นตอน (ติดตั้งสิ่งที่ขาด → build → ทดสอบ → ตัวติดตั้ง)", p)
+    row("scan   (--scan-only)", "สแกนอย่างเดียว ดูว่าตรวจเจออะไร ไม่ build — ควรรันก่อน build ครั้งแรกเสมอ", f"{p} scan")
+    row("missing   (--missing)", "ดูเฉพาะสิ่งที่ยังไม่ได้ติดตั้ง (ไลบรารี · เครื่องมือ · dependencies) พร้อมวิธีติดตั้ง", f"{p} missing")
+    row("status   (--status)", "ดูทั้งหมด: ที่ติดตั้งแล้ว + ที่ยังขาด", f"{p} status")
+    row("install [ชื่อ ...]   (--install)", "ติดตั้งสิ่งที่ยังขาดโดยไม่ build · ไม่ระบุชื่อ = ติดตั้งทั้งหมด · ระบุชื่อ = เฉพาะตัวนั้น",
+        f"{p} install        |        {p} install pillow ffmpeg")
+    row("push [ข้อความ ...]   (--push, --git)", "เชื่อมต่อและ push โค้ดขึ้น GitHub อัตโนมัติ (init, remote, add, commit, push) โดยไม่ต้องพิมพ์คำสั่ง git เอง",
+        f"{p} push        |        {p} push \"อัปเดตระบบ build ล่าสุด\"")
+    row("dry-run   (--dry-run)", "แสดงคำสั่ง build ที่จะรัน โดยไม่รันจริง", f"{p} dry-run")
+    row("logs   (--logs)", "ดึง log ล่าสุดของโปรแกรมที่ build แล้ว (Python) มาวิเคราะห์ว่าพังเพราะอะไร", f"{p} logs")
+    row("init   (--init)", "บันทึกผลสแกนเป็น autobuild.json เพื่อเปิดแก้ค่าเอง", f"{p} init")
+    row("commands   (--commands)", "แสดงคำสั่งทั้งหมด (ดูเฉพาะ Git ได้: python setupbuild.py command git)", f"{p} commands")
+
+    sec("คำสั่งเกี่ยวกับ Git & GitHub (ทำงานอัตโนมัติ ไม่ต้องพิมพ์ git command เอง)")
+    row("push   (หรือ git)", "ตรวจจับไฟล์ที่เปลี่ยน → add → commit → push ขึ้น GitHub ให้อัตโนมัติในคำสั่งเดียว", f"{p} push")
+    row("push [ข้อความ commit]", "Push ทันทีพร้อมระบุข้อความ commit (ไม่ต้องรอพิมพ์ถาม)", f"{p} push \"อัปเดตระบบ build ล่าสุด\"")
+    row("push [url] [ข้อความ]", "เชื่อมต่อ GitHub Repository ใหม่ครั้งแรก พร้อม commit และ push ทันที", f"{p} push https://github.com/user/repo.git \"first commit\"")
+    row("push status   (หรือ git status)", "ดูสถานะ Git ปัจจุบัน (branch, remote url, ไฟล์ที่แก้ไข, commit ที่ค้าง push)", f"{p} push status")
+    row("push pull   (หรือ git pull)", "ดึงโค้ดล่าสุดจาก GitHub มารวมกับในเครื่อง (git pull --rebase)", f"{p} push pull")
+    row("push log   (หรือ git log)", "ดูประวัติ commit ล่าสุด 8 รายการ", f"{p} push log")
+
+    sec("ตัวเลือกเสริม (ใช้ร่วมกับคำสั่งข้างบนได้)")
+    row("--yes", "ตอบรับค่าเริ่มต้นทุกคำถาม รันได้โดยไม่ต้องมีคนคอย (ไม่เพิ่ม Defender exclusion ให้เอง)", f"{p} install --yes")
+    row("--type ชนิด", "บังคับชนิดโปรเจกต์ (python electron tauri flutter dotnet rust go java cmake node-cli node-web)",
+        f"{p} scan --type go")
+    row("--project โฟลเดอร์", "สแกน/build โฟลเดอร์อื่น (เก็บสคริปต์ไว้ที่เดียวใช้กับหลายโปรเจกต์ได้)",
+        f'{p} missing --project "C:\\Users\\me\\myapp"')
+    row("--config ไฟล์", "ใช้ไฟล์ config อื่นแทน autobuild.json", f"{p} --config build_dev.json")
+    row("--no-scan", "ปิดการสแกนอัตโนมัติ ใช้เฉพาะค่าใน config", f"{p} --no-scan")
+
+    sec("ตัวอย่างสถานการณ์")
+    print(f"  {D}1) ใช้กับโปรเจกต์ใหม่ครั้งแรก{X}")
+    print(f"       {G}{p} scan{X}       ดูผลสแกน")
+    print(f"       {G}{p} missing{X}    เช็กว่าขาดอะไร")
+    print(f"       {G}{p} install{X}    ติดตั้งที่ขาด")
+    print(f"       {G}{p}{X}            build จริง")
+    print(f"  {D}2) เช็กเครื่องใหม่ก่อนเริ่มงาน{X}")
+    print(f"       {G}{p} status{X}")
+    print(f"  {D}3) ติดตั้งเครื่องมือเดียว เช่น ffmpeg กับ Tesseract{X}")
+    print(f"       {G}{p} install ffmpeg tesseract{X}")
+    print(f"  {D}4) รันบนเครื่อง build อัตโนมัติ (CI) — ไม่ต้องกดอะไร ถ้าขาดของจำเป็นจะจบด้วย exit code 1{X}")
+    print(f"       {G}{p} missing --yes && {p} --yes{X}")
+    print(f"  {D}5) โปรแกรมที่ build แล้วเปิดไม่ขึ้น{X}")
+    print(f"       {G}{p} logs{X}    แล้วส่ง autobuild_report.txt มาให้ดู")
+    print(f"  {D}6) ในโฟลเดอร์มีหลายชนิดปนกัน (เช่น Electron + สคริปต์ Python){X}")
+    print(f"       {G}{p} --type electron{X}")
+    print(f"  {D}7) เชื่อมต่อและ push โค้ดขึ้น GitHub อัตโนมัติโดยไม่ต้องพิมพ์คำสั่ง Git เอง{X}")
+    print(f"       {G}{p} push{X}                     (ถามข้อความ commit และ push ให้อัตโนมัติ)")
+    print(f"       {G}{p} push \"อัปเดตเวอร์ชัน 1.0\"{X}")
+    print(f"\n  {D}ไฟล์ autobuild.json (ไม่บังคับ) ใช้ทับผลสแกนเฉพาะคีย์ที่ใส่ เช่น  "
+          f"{{\"icon\": false, \"app_name\": \"MyApp\"}}{X}\n")
+
+
 # ═══ รายงานรวม + โหมด --logs ═══════════════════════════════════
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -2505,17 +3154,51 @@ def step_logs():
 def main():
     global ASSUME_YES, HERE, BUILD_LOG
 
-    ap = argparse.ArgumentParser(description="สแกนโปรเจกต์ Python แล้ว build เป็น EXE อัตโนมัติ")
+    ap = argparse.ArgumentParser(
+        description="สแกนโปรเจกต์แล้ว build เป็นโปรแกรมให้อัตโนมัติ (Python, Electron, Rust, Go, .NET, Java ฯลฯ)",
+        epilog="ดูคำสั่งทั้งหมดพร้อมตัวอย่างการใช้:  python " + os.path.basename(SELF) + " commands")
+    ap.add_argument("words", nargs="*", metavar="คำสั่ง",
+                    help="scan | missing | status | install [ชื่อ...] | push [ข้อความ...] | dry-run | logs | init | commands")
     ap.add_argument("--project", help="โฟลเดอร์โปรเจกต์ (ค่าเริ่มต้น: โฟลเดอร์ของสคริปต์)")
     ap.add_argument("--config", help="ไฟล์ config (ค่าเริ่มต้น: autobuild.json ในโปรเจกต์)")
     ap.add_argument("--scan-only", action="store_true", help="สแกนแล้วแสดงผลอย่างเดียว")
+    ap.add_argument("--missing", action="store_true", help="ดูเฉพาะสิ่งที่ยังไม่ได้ติดตั้ง")
+    ap.add_argument("--status", action="store_true", help="ดูทั้งหมด (ติดตั้งแล้ว + ยังขาด)")
+    ap.add_argument("--install", action="store_true", help="ติดตั้งสิ่งที่ยังขาด (ระบุชื่อต่อท้ายเพื่อเลือกเฉพาะตัว)")
+    ap.add_argument("--git", "--push", dest="git", action="store_true", help="เชื่อมต่อและ push โค้ดขึ้น GitHub อัตโนมัติ")
     ap.add_argument("--init", action="store_true", help="บันทึกผลสแกนเป็น autobuild.json")
-    ap.add_argument("--dry-run", action="store_true", help="แสดงคำสั่ง PyInstaller โดยไม่ build")
+    ap.add_argument("--dry-run", action="store_true", help="แสดงคำสั่ง build โดยไม่รันจริง")
     ap.add_argument("--yes", action="store_true", help="ตอบรับค่าเริ่มต้นทุกคำถาม")
     ap.add_argument("--no-scan", action="store_true", help="ปิดการสแกน ใช้เฉพาะ config")
     ap.add_argument("--type", choices=sorted(LABELS), help="บังคับชนิดโปรเจกต์ (ค่าเริ่มต้น: ตรวจเอง)")
     ap.add_argument("--logs", action="store_true", help="ดึง/วิเคราะห์ log ของโปรแกรมที่ build แล้ว")
-    args = ap.parse_args()
+    ap.add_argument("--commands", "--help-all", "--examples", dest="commands", action="store_true",
+                    help="แสดงคำสั่งทั้งหมดพร้อมตัวอย่างการใช้")
+    args = ap.parse_intermixed_args()
+
+    # คำสั่งแบบคำ (python setupbuild.py install pillow) ↔ ตัวเลือกแบบ --
+    alias = {"scan": "scan_only", "scan-only": "scan_only", "missing": "missing", "check": "missing", "uninstalled": "missing",
+             "status": "status", "info": "status", "all": "status",
+             "install": "install", "push": "git", "git": "git", "github": "git", "dry-run": "dry_run", "dryrun": "dry_run", "logs": "logs", "log": "logs",
+             "init": "init", "commands": "commands", "command": "commands", "help": "commands", "examples": "commands", "cmd": "commands", "cmds": "commands", "list": "commands",
+             "build": None}
+    words = list(args.words)
+    if words and words[0].lower() in alias:
+        key = alias[words.pop(0).lower()]
+        if key:
+            setattr(args, key, True)
+    cmd_topic = words[0].lower() if (args.commands and words) else None
+    names = words if args.install else []
+    git_words = words if args.git else []
+    if words and not (args.install or args.git or args.commands):
+        print(f"ไม่รู้จักคำสั่ง “{words[0]}” — ดูคำสั่งทั้งหมดด้วย:  python {os.path.basename(SELF)} commands")
+        sys.exit(2)
+    if args.commands:
+        print_commands(cmd_topic)
+        sys.exit(0)
+    args.quiet_scan = bool(args.missing or args.status or args.install or args.git)
+    quick = bool(args.scan_only or args.init or args.dry_run or args.missing or args.status or args.install or args.git)
+
     ASSUME_YES = args.yes
     tr = _Transcript(sys.stdout)
     sys.stdout = tr
@@ -2551,6 +3234,13 @@ def main():
     ]
     if args.logs:
         steps = [steps[0], ("ดึงและวิเคราะห์ log ของโปรแกรม", step_logs)]
+    elif args.missing or args.status:
+        steps = [steps[0], ("ตรวจสิ่งที่ยังไม่ได้ติดตั้ง", lambda: step_status(show_all=args.status))]
+    elif args.git:
+        steps = [("เชื่อมต่อและ Push ขึ้น GitHub", lambda: step_git(git_words))]
+    elif args.install:
+        steps = [steps[0], ("ติดตั้งสิ่งที่ยังขาด", lambda: step_install(names)),
+                 ("ตรวจซ้ำว่ายังขาดอะไร", lambda: step_status(False))]
     elif args.scan_only or args.init:
         steps = steps[:1]
     elif args.dry_run:
@@ -2596,13 +3286,13 @@ def main():
     if out:
         say("ตัวติดตั้ง: " + max(out, key=os.path.getmtime), G)
     failed = any(st == FAIL for _, st in results)
-    if not (args.scan_only or args.init or args.dry_run):
+    if not quick:
         rp = write_report(tr.text(), results)
         if rp:
             say("รายงานทั้งหมด: " + rp, G)
             say("(ถ้ามีปัญหา ส่งไฟล์นี้ไฟล์เดียวมาให้ดูได้เลย)", D)
     print()
-    if not ASSUME_YES and not (args.scan_only or args.init or args.dry_run):
+    if not ASSUME_YES and not quick:
         try:
             input("  กด Enter เพื่อปิด…")
         except EOFError:
