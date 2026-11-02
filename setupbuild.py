@@ -51,8 +51,6 @@ setupbuild.py — สแกนโปรเจกต์แล้ว build เป�
   7  ทดสอบเปิดโปรแกรม
   8  สร้างตัวติดตั้ง (Inno Setup — ถ้าพบไฟล์ .iss)
 """
-
-
 import argparse
 import ast
 import copy
